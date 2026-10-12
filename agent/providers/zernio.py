@@ -23,6 +23,11 @@ logger = logging.getLogger("agentkit")
 BASE_URL_POR_DEFECTO = "https://zernio.com/api/v1"
 
 
+def _conversation_id(payload: dict, mensaje: dict) -> str:
+    """El id de la conversacion viene en message.conversationId o en conversation.id."""
+    return mensaje.get("conversationId") or (payload.get("conversation") or {}).get("id") or ""
+
+
 class ProveedorZernio(ProveedorWhatsApp):
     """Proveedor de WhatsApp usando Zernio."""
 
@@ -83,8 +88,10 @@ class ProveedorZernio(ProveedorWhatsApp):
         payload = await request.json()
 
         evento = payload.get("event")
+        if evento == "message.sent":
+            return self._parsear_enviado(payload)
         if evento != "message.received":
-            # message.sent, message.delivered, message.read, etc. no se contestan
+            # message.delivered, message.read, etc. no se contestan
             logger.debug(f"Evento ignorado: {evento}")
             return []
 
@@ -110,9 +117,48 @@ class ProveedorZernio(ProveedorWhatsApp):
                 # Zernio marca la direccion: solo contestamos lo que entra
                 es_propio=mensaje.get("direction") != "incoming",
                 contexto={
+                    # Audio, imagen o archivo sin texto: el agente no puede leerlo, pero
+                    # main.py le avisa al cliente en vez de dejarlo sin respuesta.
+                    "sin_texto": not (mensaje.get("text") or "").strip() and bool(mensaje.get("attachments")),
                     "evento_id": payload.get("id", ""),
-                    "conversation_id": mensaje.get("conversationId", ""),
+                    "conversation_id": _conversation_id(payload, mensaje),
                     "account_id": cuenta.get("id", ""),
+                },
+            )
+        ]
+
+    def _parsear_enviado(self, payload: dict) -> list[MensajeEntrante]:
+        """
+        message.sent: algo salio por el numero. Si lo escribio una persona (el contador
+        desde la app de WhatsApp Business, Coexistencia) hay que dejar de contestar ahi.
+        Lo que mando el propio agente por la API (sentVia "api") o una automatizacion
+        no cuenta como intervencion.
+        """
+        mensaje = payload.get("message") or {}
+        if mensaje.get("platform") != "whatsapp":
+            return []
+
+        enviado_via = mensaje.get("sentVia")
+        logger.info(f"message.sent recibido (sentVia={enviado_via!r})")
+        # Zernio documenta sentVia = human | api | broadcast | sequence | workflow | ...
+        # y null cuando no lo sabe. Los mensajes del contador desde el telefono llegan como
+        # human o null; todo lo demas es automatico. main.py descarta ademas los ecos de lo
+        # que el propio agente acaba de mandar.
+        if enviado_via not in (None, "", "human"):
+            return []
+
+        cuenta = payload.get("account") or {}
+        return [
+            MensajeEntrante(
+                telefono="",
+                texto=mensaje.get("text") or "",
+                mensaje_id=mensaje.get("platformMessageId") or mensaje.get("id") or "",
+                es_propio=True,
+                contexto={
+                    "evento_id": payload.get("id", ""),
+                    "conversation_id": _conversation_id(payload, mensaje),
+                    "account_id": cuenta.get("id", "") or cuenta.get("accountId", ""),
+                    "intervencion_humana": True,
                 },
             )
         ]

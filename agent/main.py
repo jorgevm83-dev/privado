@@ -9,21 +9,23 @@ Funciona con cualquier proveedor (Zernio, Meta) gracias a la capa de providers.
 import asyncio
 import logging
 import os
-from collections import defaultdict
+from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 
 from dotenv import load_dotenv
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.responses import PlainTextResponse
 
-from agent.brain import generar_respuesta, obtener_mensaje_error
+from agent.brain import generar_respuesta, obtener_mensaje_error, obtener_mensaje_sin_texto
 from agent.memory import (
     guardar_mensaje,
     inicializar_db,
     liberar_evento,
+    esta_pausada,
     limpiar_eventos_viejos,
     marcar_evento_procesado,
     obtener_historial,
+    pausar_conversacion,
 )
 from agent.providers import obtener_proveedor
 from agent.providers.base import MensajeEntrante
@@ -45,10 +47,23 @@ logger.setLevel(logging.DEBUG if ENVIRONMENT == "development" else logging.INFO)
 
 PORT = int(os.getenv("PORT", "8000"))
 
+# Cuando el contador escribe a mano en una conversacion, el agente se calla ahi durante
+# estas horas (se renueva con cada mensaje suyo). Se cambia desde las variables de Railway.
+PAUSA_HORAS = float(os.getenv("PAUSA_HORAS") or "12")
+
 # Un candado por numero de telefono. En WhatsApp es normal que alguien mande "hola" y
 # medio segundo despues la pregunta de verdad: sin esto los dos mensajes se procesarian
 # en paralelo, los dos leerian el mismo historial y las escrituras quedarian intercaladas.
 _candados: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+
+# Lo ultimo que el propio agente mando en cada conversacion. Zernio avisa de TODO lo que sale
+# por el numero, incluidas las respuestas del agente; sin esto, el agente se confundiria
+# con su propio eco y se pausaria solo.
+_enviados_por_el_agente: dict[str, deque] = defaultdict(lambda: deque(maxlen=10))
+
+
+def _normalizar(texto: str) -> str:
+    return " ".join((texto or "").split())
 
 # Si la configuracion esta mal, guardamos el error y lo mostramos en el health check,
 # en vez de reventar en el import y dejar a Railway reiniciando el contenedor a ciegas.
@@ -148,7 +163,13 @@ async def webhook_handler(request: Request, tareas: BackgroundTasks):
 
     encolados = 0
     for msg in mensajes:
-        if msg.es_propio or not msg.texto.strip():
+        if msg.es_propio and msg.contexto.get("intervencion_humana"):
+            await _registrar_intervencion(msg)
+            continue
+
+        if msg.es_propio:
+            continue
+        if not msg.texto.strip() and not msg.contexto.get("sin_texto"):
             continue
 
         # La entrega es "al menos una vez": el mismo evento puede llegar dos veces
@@ -157,11 +178,27 @@ async def webhook_handler(request: Request, tareas: BackgroundTasks):
             logger.info(f"Evento repetido, se ignora: {evento_id}")
             continue
 
-        logger.info(f"Mensaje de {msg.telefono}: {msg.texto}")
+        logger.info(f"Mensaje de {msg.telefono}: {msg.texto or '[audio, imagen o archivo sin texto]'}")
         tareas.add_task(procesar_mensaje, msg)
         encolados += 1
 
     return {"status": "ok", "encolados": encolados}
+
+
+async def _registrar_intervencion(msg: MensajeEntrante):
+    """El contador escribio desde su telefono: el agente deja esa conversacion en paz."""
+    conversation_id = msg.contexto.get("conversation_id", "")
+    if not conversation_id:
+        logger.warning("Escribiste a mano, pero el evento no trae conversation_id: no se pudo pausar")
+        return
+
+    texto = _normalizar(msg.texto)
+    if texto and texto in _enviados_por_el_agente[conversation_id]:
+        logger.debug("Eco de una respuesta del propio agente: no es una intervencion")
+        return
+
+    await pausar_conversacion(conversation_id, PAUSA_HORAS)
+    logger.info(f"Intervencion humana en {conversation_id}: el agente se pausa {PAUSA_HORAS:g} h")
 
 
 async def procesar_mensaje(msg: MensajeEntrante):
@@ -177,9 +214,26 @@ async def procesar_mensaje(msg: MensajeEntrante):
         try:
             # El historial se lee ANTES de guardar el mensaje actual: brain.py agrega
             # el mensaje nuevo al final, y asi no queda duplicado.
-            historial = await obtener_historial(msg.telefono)
-            respuesta, es_respuesta_real = await generar_respuesta(msg.texto, historial)
+            conversation_id = msg.contexto.get("conversation_id", "")
+            if await esta_pausada(conversation_id):
+                # El contador esta atendiendo a mano. Se guarda lo que escribe el cliente
+                # para que el agente tenga contexto cuando se reactive, pero no se contesta.
+                await guardar_mensaje(msg.telefono, "user", msg.texto)
+                logger.info(f"Conversacion pausada por intervencion humana; no se contesta a {msg.telefono}")
+                return
 
+            if not msg.texto.strip():
+                # Audio, imagen o archivo: no se puede leer. Se avisa y se pide texto, sin gastar Claude.
+                enviado = await proveedor.enviar_mensaje(msg.telefono, obtener_mensaje_sin_texto(), msg.contexto)
+                if not enviado:
+                    await liberar_evento(evento_id)
+                return
+
+            historial = await obtener_historial(msg.telefono)
+            respuesta, es_respuesta_real = await generar_respuesta(msg.texto, historial, msg.telefono)
+
+            # Se anota ANTES de enviar: el eco del envio puede llegar antes de que regrese la llamada.
+            _enviados_por_el_agente[conversation_id].append(_normalizar(respuesta))
             enviado = await proveedor.enviar_mensaje(msg.telefono, respuesta, msg.contexto)
 
             if not enviado:

@@ -78,6 +78,20 @@ class EventoProcesado(Base):
     creado_en: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=ahora, index=True)
 
 
+class Pausa(Base):
+    """
+    Conversaciones donde el agente esta en silencio porque el contador escribio a mano.
+
+    Se identifica por conversation_id (el mensaje que el contador manda desde la app no
+    siempre trae el telefono del cliente, pero si la conversacion).
+    """
+
+    __tablename__ = "pausas"
+
+    conversation_id: Mapped[str] = mapped_column(String(200), primary_key=True)
+    hasta: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
 async def inicializar_db():
     """Crea las tablas si no existen."""
     async with engine.begin() as conn:
@@ -169,3 +183,27 @@ async def limpiar_historial(telefono: str):
     async with async_session() as session:
         await session.execute(delete(Mensaje).where(Mensaje.telefono == telefono))
         await session.commit()
+
+
+async def pausar_conversacion(conversation_id: str, horas: float):
+    """Silencia al agente en esa conversacion durante N horas (se renueva con cada aviso)."""
+    if not conversation_id:
+        return
+    hasta = ahora() + timedelta(hours=horas)
+    async with async_session() as session:
+        await session.merge(Pausa(conversation_id=conversation_id, hasta=hasta))
+        await session.commit()
+
+
+async def esta_pausada(conversation_id: str) -> bool:
+    """True si el contador intervino en esa conversacion y la pausa sigue vigente."""
+    if not conversation_id:
+        return False
+    async with async_session() as session:
+        pausa = await session.get(Pausa, conversation_id)
+    if pausa is None:
+        return False
+    hasta = pausa.hasta
+    if hasta.tzinfo is None:  # SQLite devuelve fechas sin zona horaria
+        hasta = hasta.replace(tzinfo=timezone.utc)
+    return hasta > ahora()
