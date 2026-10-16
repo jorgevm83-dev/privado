@@ -1,0 +1,23 @@
+# Configuración del negocio — Generado por AgentKit
+negocio:
+  nombre: "Vera Contadores"
+  descripcion: >
+    Despacho contable en Monterrey, N.L., a cargo del C.P. Jorge Vera. Atiende a personas
+    físicas y morales con contabilidad, impuestos y asesoría financiera.
+  horario: "Lunes a viernes de 9:00 a 18:00. Sábado y domingo cerrado."
+  direccion: "Torre BH, Blvd. Antonio L. Rodríguez 2100, piso 11, int. 116, Santa María, Monterrey, N.L."
+  telefono_whatsapp: "81 3241 4327"
+  sitio_web: "vera-contadores.com"
+
+agente:
+  nombre: "Vera Contadores"
+  tono: "Profesional y cercano (mezcla de formal y amigable)"
+  casos_de_uso:
+    - "Responder preguntas frecuentes sobre el despacho y sus servicios"
+    - "Orientar de forma general sobre dudas contables y fiscales"
+    - "Recabar datos para solicitar una cita con el contador"
+
+metadata:
+  creado: "2026-10-11"
+  proveedor: "zernio"
+  version: "2.0"
