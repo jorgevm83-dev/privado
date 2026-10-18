@@ -27,6 +27,7 @@ from agent.memory import (
     obtener_historial,
     pausar_conversacion,
 )
+from agent.llamadas import router as router_llamadas
 from agent.providers import obtener_proveedor
 from agent.providers.base import MensajeEntrante
 
@@ -100,6 +101,9 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="AgentKit — WhatsApp AI Agent", version="2.0.0", lifespan=lifespan)
+
+# Recados del agente de voz (Retell): POST /retell-webhook?token=...
+app.include_router(router_llamadas)
 
 
 @app.get("/")
